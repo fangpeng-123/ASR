@@ -1,0 +1,12 @@
+server:
+  host: 0.0.0.0
+  port: 8000
+dashscope:
+  default_model: paraformer-realtime-v2
+asr:
+  formats: [pcm, wav, mp3]
+  sample_rates: [8000, 16000, 24000, 44100, 48000]
+  supported_combinations:
+    - [paraformer-realtime-v2, 16000]
+    - [paraformer-realtime-8k-v2, 8000]
+  frame_ms: 20
