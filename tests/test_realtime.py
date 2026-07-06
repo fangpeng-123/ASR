@@ -193,3 +193,51 @@ def test_ws_cancel(monkeypatch):
         ws.send_json({"action": "cancel"})
         msg = ws.receive_json()
     assert msg["code"] == "cancelled"
+
+
+def test_callback_on_event_exception():
+    loop = asyncio.new_event_loop()
+    try:
+        q = asyncio.Queue()
+        cb = _Callback(loop, q)
+        cb.on_event(SimpleNamespace(get_sentence=lambda: 1 / 0))
+        loop.run_until_complete(asyncio.sleep(0.01))
+        items = []
+        while not q.empty():
+            items.append(loop.run_until_complete(q.get()))
+        assert any(i["type"] == "error" and i["code"] == "internal" for i in items)
+    finally:
+        loop.close()
+
+
+def test_results_skips_closed(monkeypatch):
+    fake_instance = MagicMock()
+    monkeypatch.setattr("api.realtime_recognizer.Recognition",
+                        MagicMock(return_value=fake_instance))
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+    loop = asyncio.new_event_loop()
+    try:
+        rec = RealtimeRecognizer(_cfg(), "paraformer-realtime-v2", "pcm", 16000, loop=loop)
+        rec._callback._put({"type": "partial", "text": "hi"})
+        rec._callback._put({"type": "closed"})
+
+        async def collect():
+            out = []
+            async for item in rec.results():
+                out.append(item)
+            return out
+
+        out = loop.run_until_complete(collect())
+        assert out == [{"type": "partial", "text": "hi"}]  # closed 不外发
+    finally:
+        loop.close()
+
+
+def test_ws_rejects_non_pcm_format(monkeypatch):
+    client = _client_with_fake_recognizer(monkeypatch, [])
+    with client.websocket_connect("/api/v1/asr/ws") as ws:
+        ws.send_json({"action": "start", "model": "paraformer-realtime-v2",
+                      "format": "wav", "sample_rate": 16000})
+        msg = ws.receive_json()
+    assert msg["type"] == "error"
+    assert msg["code"] == "invalid_start"

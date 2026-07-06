@@ -75,12 +75,16 @@ async def asr_ws(websocket: WebSocket):
         await _send_error(websocket, "invalid_start", "unsupported model/format/sample_rate")
         await websocket.close(code=WS_1008_POLICY_VIOLATION)
         return
+    if ctrl.format != "pcm":
+        await _send_error(websocket, "invalid_start", "streaming supports pcm only")
+        await websocket.close(code=WS_1008_POLICY_VIOLATION)
+        return
 
     loop = asyncio.get_running_loop()
-    recognizer = RealtimeRecognizer(
-        cfg, ctrl.model, ctrl.format, ctrl.sample_rate,
-        ctrl.enable_diarization, loop=loop)
     try:
+        recognizer = RealtimeRecognizer(
+            cfg, ctrl.model, ctrl.format, ctrl.sample_rate,
+            ctrl.enable_diarization, loop=loop)
         recognizer.start()
     except Exception as e:
         await _send_error(websocket, "internal", str(e))
@@ -100,7 +104,11 @@ async def asr_ws(websocket: WebSocket):
             if msg.get("bytes") is not None:
                 recognizer.send_audio_chunk(msg["bytes"])
             elif msg.get("text") is not None:
-                c = WSControlMessage(**json.loads(msg["text"]))
+                try:
+                    c = WSControlMessage(**json.loads(msg["text"]))
+                except Exception:
+                    await _send_error(websocket, "internal", "invalid control frame")
+                    return "error"
                 if c.action == "finish":
                     recognizer.stop()
                     return "finish"

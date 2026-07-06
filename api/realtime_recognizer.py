@@ -16,22 +16,26 @@ class _Callback(RecognitionCallback):
         self._last_end_time = 0
 
     def on_event(self, result: RecognitionResult) -> None:
-        sentence = result.get_sentence()
-        if sentence is None:
-            return
-        items = sentence if isinstance(sentence, list) else [sentence]
-        for s in items:
-            is_end = RecognitionResult.is_sentence_end(s)
-            end_time = s.get("end_time")
-            if end_time:
-                self._last_end_time = max(self._last_end_time, int(end_time))
-            self._put({
-                "type": "sentence" if is_end else "partial",
-                "text": s.get("text", ""),
-                "begin_time": s.get("begin_time"),
-                "end_time": end_time,
-                "speaker": (str(s["speaker_id"]) if "speaker_id" in s else None),
-            })
+        try:
+            sentence = result.get_sentence()
+            if sentence is None:
+                return
+            items = sentence if isinstance(sentence, list) else [sentence]
+            for s in items:
+                is_end = RecognitionResult.is_sentence_end(s)
+                end_time = s.get("end_time")
+                if end_time:
+                    self._last_end_time = max(self._last_end_time, int(end_time))
+                self._put({
+                    "type": "sentence" if is_end else "partial",
+                    "text": s.get("text", ""),
+                    "begin_time": s.get("begin_time"),
+                    "end_time": end_time,
+                    "speaker": (str(s["speaker_id"]) if "speaker_id" in s else None),
+                })
+        except Exception:
+            self._put({"type": "error", "code": "internal",
+                       "message": "callback processing failed"})
 
     def on_error(self, result: RecognitionResult) -> None:
         self._put({"type": "error", "code": "internal",
@@ -41,6 +45,7 @@ class _Callback(RecognitionCallback):
         self._put({"type": "done", "duration_ms": self._last_end_time})
 
     def on_close(self) -> None:
+        # 终止哨兵：让 results() 退出，但不发给客户端（closed 不是合法 WSResultMessage type）
         self._put({"type": "closed"})
 
     def _put(self, item: dict) -> None:
@@ -63,11 +68,9 @@ class RealtimeRecognizer:
         )
         self._kwargs = {"diarization_enabled": True} if enable_diarization else {}
         self._leftover = b""
-        self._running = False
 
     def start(self) -> None:
         self._recognition.start(**self._kwargs)
-        self._running = True
 
     def _frame_bytes(self) -> int:
         # 16-bit mono: 每帧字节数 = sample_rate * 2 * (frame_ms/1000)，并对齐到偶数
@@ -90,12 +93,10 @@ class RealtimeRecognizer:
                 self._recognition.send_audio_frame(chunk)
 
     def stop(self) -> None:
-        self._running = False
         self._recognition.stop()
 
     def cancel(self) -> None:
         # SDK 无 cancel：用 stop() 优雅停止，丢弃后续结果。
-        self._running = False
         try:
             self._recognition.stop()
         except Exception:
@@ -104,6 +105,9 @@ class RealtimeRecognizer:
     async def results(self) -> AsyncIterator[dict]:
         while True:
             item = await self._queue.get()
+            t = item.get("type")
+            if t == "closed":
+                break  # 终止哨兵，不发给客户端
             yield item
-            if item.get("type") in ("done", "error", "closed"):
+            if t in ("done", "error"):
                 break
