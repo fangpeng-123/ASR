@@ -63,6 +63,97 @@ def _strip_wav_header(data: bytes) -> bytes:
     return data
 
 
+def _read_file_audio(args: argparse.Namespace) -> bytes:
+    with open(args.file, "rb") as f:
+        data = f.read()
+    if args.format == "wav":
+        data = _strip_wav_header(data)
+    return data
+
+
+async def _print_results(ws) -> None:
+    while True:
+        msg = await ws.receive_json()
+        t = msg.get("type")
+        if t == "partial":
+            print(f"\r{msg.get('text', '')}", end="", flush=True)
+        elif t == "sentence":
+            print(f"\r{msg.get('text', '')}", flush=True)
+        elif t == "done":
+            print(flush=True)
+            return
+        elif t == "error":
+            print(f"\n错误: {msg}", file=sys.stderr)
+            return
+
+
+async def _stream_file(ws, args: argparse.Namespace) -> None:
+    data = _read_file_audio(args)
+    chunk = max(2, int(args.sample_rate * 2 * 0.02))  # 20ms
+
+    async def sender():
+        for i in range(0, len(data), chunk):
+            await ws.send_bytes(data[i:i + chunk])
+            await asyncio.sleep(0.02)
+        await ws.send_json({"action": "finish"})
+
+    await asyncio.gather(sender(), _print_results(ws))
+
+
+async def _stream_microphone(ws, args: argparse.Namespace) -> None:
+    try:
+        import sounddevice as sd
+    except ImportError:
+        _die("麦克风需要 sounddevice，请安装: pip install sounddevice numpy")
+
+    loop = asyncio.get_running_loop()
+    audio_q: asyncio.Queue = asyncio.Queue()
+    block = max(1, int(args.sample_rate * 0.02))  # 20ms 帧样本数
+
+    def callback(indata, frames, time_info, status):
+        if status:
+            print(f"\r[sd:{status}]", end="", file=sys.stderr, flush=True)
+        loop.call_soon_threadsafe(audio_q.put_nowait, indata.tobytes())
+
+    async def sender(stop_evt):
+        while not stop_evt.is_set():
+            try:
+                data = await asyncio.wait_for(audio_q.get(), timeout=0.2)
+                await ws.send_bytes(data)
+            except asyncio.TimeoutError:
+                continue
+
+    print("麦克风实时识别中（对着麦克风说话；按 Enter 结束并发送最终结果，Ctrl+C 强制退出）...", file=sys.stderr)
+    stream = sd.InputStream(
+        samplerate=args.sample_rate, channels=1, dtype="int16",
+        blocksize=block, callback=callback)
+    stream.start()
+    stop_evt = asyncio.Event()
+    rcv = asyncio.create_task(_print_results(ws))
+    snd = asyncio.create_task(sender(stop_evt))
+    try:
+        await asyncio.to_thread(input)  # 在线程里等 Enter，不卡事件循环
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        pass
+    finally:
+        stop_evt.set()
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:
+            pass
+        try:
+            await ws.send_json({"action": "finish"})
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(rcv, timeout=5)
+        except Exception:
+            pass
+        if not snd.done():
+            snd.cancel()
+
+
 async def cmd_stream(args: argparse.Namespace) -> None:
     ws_url = args.base_url.replace("http://", "ws://").replace("https://", "wss://") + "/api/v1/asr/ws"
     try:
@@ -74,51 +165,12 @@ async def cmd_stream(args: argparse.Namespace) -> None:
             ready = await ws.receive_json()
             if ready.get("type") == "error":
                 _die(f"启动失败: {ready}")
-
-            async def sender():
-                data = await _read_stream_audio(args)
-                chunk = max(2, int(args.sample_rate * 2 * 0.02))  # 20ms
-                for i in range(0, len(data), chunk):
-                    await ws.send_bytes(data[i:i + chunk])
-                    await asyncio.sleep(0.02)
-                await ws.send_json({"action": "finish"})
-
-            async def receiver():
-                while True:
-                    msg = await ws.receive_json()
-                    t = msg.get("type")
-                    if t == "partial":
-                        print(f"\r{msg.get('text', '')}", end="", flush=True)
-                    elif t == "sentence":
-                        print(f"\r{msg.get('text', '')}", flush=True)
-                    elif t == "done":
-                        print(flush=True)
-                        return
-                    elif t == "error":
-                        print(f"\n错误: {msg}", file=sys.stderr)
-                        return
-
-            await asyncio.gather(sender(), receiver())
+            if args.microphone:
+                await _stream_microphone(ws, args)
+            else:
+                await _stream_file(ws, args)
     except httpx.ConnectError:
         _die("无法连接 ASR 服务，请先启动: python -m api.main")
-
-
-async def _read_stream_audio(args: argparse.Namespace) -> bytes:
-    if args.microphone:
-        try:
-            import sounddevice as sd
-        except ImportError:
-            _die("麦克风需要 sounddevice，请安装: pip install sounddevice numpy")
-        import numpy as np
-        rec = sd.rec(int(args.sample_rate * 5), samplerate=args.sample_rate,
-                     channels=1, dtype="int16")
-        sd.wait()
-        return rec.tobytes()
-    with open(args.file, "rb") as f:
-        data = f.read()
-    if args.format == "wav":
-        data = _strip_wav_header(data)
-    return data
 
 
 def main(argv=None) -> None:

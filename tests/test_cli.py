@@ -97,9 +97,9 @@ def test_microphone_missing_dep_hint(monkeypatch, capsys):
             raise ImportError("no sounddevice")
         return real_import(name, *a, **k)
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    from cli.asr import _read_stream_audio
-    args = type("A", (), {"file": None, "microphone": True, "sample_rate": 16000, "format": "pcm"})()
+    from cli.asr import _stream_microphone
+    args = type("A", (), {"microphone": True, "sample_rate": 16000, "format": "pcm"})()
     with pytest.raises(SystemExit):
-        asyncio.run(_read_stream_audio(args))
+        asyncio.run(_stream_microphone(ws=None, args=args))
     err = capsys.readouterr().err
     assert "sounddevice" in err
