@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 
 from api.config import load_config
+from api.routes import asr as asr_route
 from api.routes import health
 
 
@@ -8,7 +9,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="DashScope ASR")
     app.state.config = load_config()
     app.include_router(health.router)
-    # asr 路由在 Task 6 注册
+    app.include_router(asr_route.router)
     return app
 
 
