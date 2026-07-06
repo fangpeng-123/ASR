@@ -21,12 +21,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--enable-diarization", action="store_true")
     p.add_argument("--output", help="将结果写入 JSON 文件（文件模式）")
     p.add_argument("--base-url", default=DEFAULT_URL)
+    p.add_argument("--device", type=int, default=None, help="麦克风输入设备编号（--list-devices 查看）")
+    p.add_argument("--list-devices", action="store_true", help="列出音频输入设备后退出")
     return p
 
 
 def _die(msg: str) -> None:
     print(msg, file=sys.stderr)
     sys.exit(1)
+
+
+def _list_input_devices() -> None:
+    try:
+        import sounddevice as sd
+    except ImportError:
+        _die("需要 sounddevice: pip install sounddevice numpy")
+    print("输入设备：")
+    for i, d in enumerate(sd.query_devices()):
+        if d["max_input_channels"] > 0:
+            print(f"  [{i}] {d['name']}  in={d['max_input_channels']}ch  rate={d['default_samplerate']}")
 
 
 def cmd_file(args: argparse.Namespace) -> None:
@@ -109,6 +122,13 @@ async def _stream_microphone(ws, args: argparse.Namespace) -> None:
     loop = asyncio.get_running_loop()
     audio_q: asyncio.Queue = asyncio.Queue()
     block = max(1, int(args.sample_rate * 0.02))  # 20ms 帧样本数
+    dev = args.device if args.device is not None else sd.default.device[0]
+    try:
+        dev_info = sd.query_devices(dev, "input")
+        dev_name = dev_info.get("name", "?")
+    except Exception:
+        dev_name = str(dev)
+    print(f"使用输入设备 [{dev}] {dev_name} @ {args.sample_rate}Hz", file=sys.stderr)
 
     def callback(indata, frames, time_info, status):
         if status:
@@ -123,10 +143,10 @@ async def _stream_microphone(ws, args: argparse.Namespace) -> None:
             except asyncio.TimeoutError:
                 continue
 
-    print("麦克风实时识别中（对着麦克风说话；按 Enter 结束并发送最终结果，Ctrl+C 强制退出）...", file=sys.stderr)
+    print("麦克风实时识别中（对着麦克风说话；按 Enter 结束并发送最终结果，Ctrl+C 退出）...", file=sys.stderr)
     stream = sd.InputStream(
         samplerate=args.sample_rate, channels=1, dtype="int16",
-        blocksize=block, callback=callback)
+        blocksize=block, callback=callback, device=dev)
     stream.start()
     stop_evt = asyncio.Event()
     rcv = asyncio.create_task(_print_results(ws))
@@ -142,6 +162,12 @@ async def _stream_microphone(ws, args: argparse.Namespace) -> None:
             stream.close()
         except Exception:
             pass
+        # 让 sender 把队列里残余音频发完，避免结尾被截断
+        if not snd.done():
+            try:
+                await asyncio.wait_for(snd, timeout=1.0)
+            except Exception:
+                snd.cancel()
         try:
             await ws.send_json({"action": "finish"})
         except Exception:
@@ -175,8 +201,11 @@ async def cmd_stream(args: argparse.Namespace) -> None:
 
 def main(argv=None) -> None:
     args = build_parser().parse_args(argv)
+    if args.list_devices:
+        _list_input_devices()
+        return
     if not args.file and not args.stream:
-        print("用法: python -m cli.asr --file <audio> | --stream [--file <audio> | --microphone]", file=sys.stderr)
+        print("用法: python -m cli.asr --file <audio> | --stream [--file <audio> | --microphone] [--device N]", file=sys.stderr)
         sys.exit(2)
     if args.stream:
         asyncio.run(cmd_stream(args))

@@ -98,7 +98,7 @@ def test_microphone_missing_dep_hint(monkeypatch, capsys):
         return real_import(name, *a, **k)
     monkeypatch.setattr(builtins, "__import__", fake_import)
     from cli.asr import _stream_microphone
-    args = type("A", (), {"microphone": True, "sample_rate": 16000, "format": "pcm"})()
+    args = type("A", (), {"microphone": True, "sample_rate": 16000, "format": "pcm", "device": None})()
     with pytest.raises(SystemExit):
         asyncio.run(_stream_microphone(ws=None, args=args))
     err = capsys.readouterr().err
