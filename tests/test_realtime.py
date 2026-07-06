@@ -5,7 +5,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from api.config import load_config
+from api.main import create_app
 from api.realtime_recognizer import RealtimeRecognizer, _Callback
+from fastapi.testclient import TestClient
 
 
 def _cfg():
@@ -102,3 +104,92 @@ def test_start_stop_delegate(monkeypatch):
         fake_instance.stop.assert_called_once()
     finally:
         loop.close()
+
+
+class _FakeRecognizer:
+    """可控的假识别器：按预设序列吐结果，发完后阻塞（模拟真实 queue 等待）。"""
+    def __init__(self, events):
+        self._events = events
+        self.started = False
+        self.stopped = False
+        self.cancelled = False
+        self.chunks = []
+
+    def start(self):
+        self.started = True
+
+    def send_audio_chunk(self, data):
+        self.chunks.append(data)
+
+    def stop(self):
+        self.stopped = True
+
+    def cancel(self):
+        self.cancelled = True
+
+    async def results(self):
+        for e in self._events:
+            yield e
+        await asyncio.Event().wait()  # 阻塞，模拟真实识别器等待队列
+
+
+def _client_with_fake_recognizer(monkeypatch, events):
+    monkeypatch.setattr("api.routes.asr.RealtimeRecognizer",
+                        lambda *a, **k: _FakeRecognizer(events))
+    return TestClient(create_app())
+
+
+def test_ws_start_ready(monkeypatch):
+    client = _client_with_fake_recognizer(monkeypatch, [])
+    with client.websocket_connect("/api/v1/asr/ws") as ws:
+        ws.send_json({"action": "start", "model": "paraformer-realtime-v2",
+                      "format": "pcm", "sample_rate": 16000})
+        msg = ws.receive_json()
+    assert msg["type"] == "ready"
+
+
+def test_ws_invalid_start_missing_format(monkeypatch):
+    client = _client_with_fake_recognizer(monkeypatch, [])
+    with client.websocket_connect("/api/v1/asr/ws") as ws:
+        ws.send_json({"action": "start", "model": "paraformer-realtime-v2",
+                      "format": "pcm"})  # 缺 sample_rate
+        msg = ws.receive_json()
+    assert msg["type"] == "error"
+    assert msg["code"] == "invalid_start"
+
+
+def test_ws_not_started_on_binary(monkeypatch):
+    client = _client_with_fake_recognizer(monkeypatch, [])
+    with client.websocket_connect("/api/v1/asr/ws") as ws:
+        ws.send_bytes(b"\x00" * 640)
+        msg = ws.receive_json()
+    assert msg["type"] == "error"
+    assert msg["code"] == "not_started"
+
+
+def test_ws_partial_sentence_done(monkeypatch):
+    events = [
+        {"type": "partial", "text": "你"},
+        {"type": "sentence", "text": "你好", "begin_time": 0, "end_time": 1500},
+        {"type": "done", "duration_ms": 1500},
+    ]
+    client = _client_with_fake_recognizer(monkeypatch, events)
+    with client.websocket_connect("/api/v1/asr/ws") as ws:
+        ws.send_json({"action": "start", "model": "paraformer-realtime-v2",
+                      "format": "pcm", "sample_rate": 16000})
+        ws.receive_json()  # ready
+        ws.send_bytes(b"\x00" * 640)
+        ws.send_json({"action": "finish"})
+        msgs = [ws.receive_json() for _ in range(3)]
+    assert [m["type"] for m in msgs] == ["partial", "sentence", "done"]
+
+
+def test_ws_cancel(monkeypatch):
+    client = _client_with_fake_recognizer(monkeypatch, [])
+    with client.websocket_connect("/api/v1/asr/ws") as ws:
+        ws.send_json({"action": "start", "model": "paraformer-realtime-v2",
+                      "format": "pcm", "sample_rate": 16000})
+        ws.receive_json()
+        ws.send_json({"action": "cancel"})
+        msg = ws.receive_json()
+    assert msg["code"] == "cancelled"
